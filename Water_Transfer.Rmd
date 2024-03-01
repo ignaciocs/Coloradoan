@@ -1,0 +1,180 @@
+---
+title: "Water Transfer Data Analysis"
+author: "Ignacio Calderon"
+output:
+  html_document:
+    theme: united
+    highlight: zenburn
+---
+
+## Background
+
+In 1957, the Colorado-Big Thompson Project established 310,000 shares, mostly for irrigation farming. Each share or unit, is [equivalent to 1/310,000](https://www.northernwater.org/your-water/allottees/cbt-quota) of the total water quantity made available on a given year. 
+
+If an annual quota is set to 100%, then 1 share is equal to 1 acre-foot of water. If an annual quota is set 50%, 1 share is equal to 0.5 acre-foot of water.
+
+In recent years, cities have been buying shares to meet the demands of growing populations. 
+
+The following is a data analysis of water transfer data from the Northern Colorado Water Conservancy District. Any time water shares change hands, this is recorded under "Allotment Transfers" in the [Northern Water Board's monthly meetings](https://www.northernwater.org/about-us/agendas-and-minutes). 
+
+Records available online go back to June 2019. We manually compiled the data found in the 50+ documents into a single spreadsheet. From here, we used the following R script to clean, filter, and analyze the data.
+
+
+```{r, setup, warning=F, message=F}
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(DT)
+
+# import data
+raw <- read_csv("01-data-raw/allotment_transfer_data.csv") %>%
+  clean_names() %>% # clean column names
+  select(-current_acre_foot_units)
+```
+
+The compiled raw data looks like this:
+
+```{r, raw, echo=F}
+datatable(raw, extensions = 'Buttons', options = list(
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel', 'pdf', 'print')
+  )
+)
+```
+
+It includes from which entity to which entity the water was transferred to, how many units were transferred and the current and new type of contract it's under. The type of contract, denoted by the value on the **S.T.R.** column indicates how the water is used. (Section-Township-Range, is the system how the Public Land Survey System divides land in the U.S.).
+
+Here's an overview of contract classes found in this dataset:
+
+|Contract |Use                                                        |Example S.T.R         |
+|:-------:|:---------------------------------------------------------:|:--------------------:|
+|Class B  |Municipalities such as cities and towns                    |"TU" and "Section 131"|
+|Class C  |Domestic, irrigation, multipurpose or industrial use       |"Corp"                |
+|Class D  |Privately owned land. Typically, these are irrigated farms.|"21-02-68"            |
+
+More information about contract types can be found [here](https://www.northernwater.org/your-water/allottees/contracts).
+
+For this analysis, we focused on the water transfers that had a change of contract type. This would exclude transfers recorded when a family passes down their shares among them or sells them to an external entity that will keep them in the same use.
+
+To find these transfers, we cleaned the data and then applied several filters to match our criteria.
+
+We started by making everything upper case, removing extra spaces, and standardizing some name variations:
+
+```{r, clean, warning=F, message=F}
+data <- raw %>%
+  mutate(current_allottee = toupper(current_allottee),
+         new_allottees = toupper(new_allottees),
+         current_allottee = gsub("ET AL\\.?$", "", current_allottee),
+         new_allottees = gsub("ET AL\\.?$", "", new_allottees),
+         current_allottee = case_when(current_allottee == "MAPLEWOOD ACRES" ~ "MAPLEWOOD ACRES, INC.",
+                                      current_allottee == "HOSHIKO LAND LLC" ~ "HOSHIKO-DJ LAND, LLC",
+                                      T ~ current_allottee),
+         new_allottees = case_when(new_allottees == "POUDRE SCHOOL DISTRICT" ~ "POUDRE SCHOOL DISTRICT R-1",
+                                   T ~ new_allottees),
+         new_str = gsub("Sec 131", "Section 131", new_str)) %>% # to match current_str format
+  mutate_all(trimws) %>% # trimming leading and trailing spaces
+  mutate(new_acre_foot_units = as.double(new_acre_foot_units),
+         date = mdy(date))
+```
+
+Then we applied the following filters:
+
+* remove entries with missing data or from active account
+* remove entries where the current and new user are the same and the use type is the same (i.e. from ag to ag)
+* remove entries where the current and new user are very similar and the use type is the same. This adds some flexibility to account for inconsistencies with how names are written. For example, "John Doe", "John Doe." and "John P. Doe" would be recognized as the same person. Similarly, the S.T.R. values "21-02-68" and "21-2-68" would be recognized as the same.
+
+```{r, clean2, warning=F, message=F}
+# remove logs with STR = inactive account/NA
+data1 <- filter(data, 
+                new_str != "Inactive Account") %>% drop_na() # 464 obs
+
+# remove logs with exact match in current/new allottee and STR
+# these are not actual transfers
+data2 <- data1 %>%
+  mutate(exact_match = case_when(
+    current_allottee == new_allottees & current_str == new_str ~ T, T ~ F)) %>%
+  filter(exact_match == F) %>%
+  select(-exact_match)
+
+# remove logs with close match in STR and close match in allottee
+# this is for entries with name inconsistencies (periods/spaces/middle initials)
+data3 <- data2 %>%
+  mutate(dist_allottee = mapply(adist, current_allottee, new_allottees),
+         dist_str = mapply(adist, current_str, new_str),
+         close_match = case_when(dist_allottee <= 3 & dist_str <= 3 ~ T, T ~ F)) %>%
+  filter(close_match == F) %>%
+  select(-close_match, -dist_allottee, dist_str)
+
+# add contract class labels based on STR
+data4 <- data3 %>%
+  mutate(current_class = case_when(current_str %in% c("Section 131", "TU")  ~ "Class B",
+                                   current_str == "Corp" ~ "Class C",
+                                   T ~ "Class D"),
+         new_class = case_when(new_str %in% c("Section 131", "TU")  ~ "Class B",
+                               new_str == "Corp" ~ "Class C",
+                               T ~ "Class D")) %>%
+  filter(current_class != new_class) %>%
+  mutate(transfer_type = paste(current_class, new_class, sep = " to "),
+         year = year(date))
+```
+
+Between June 2019 through January 2024, 4396 shares changed hands over 237 water transfers. The average transfer was for 19 units and the single biggest transfer was for 190 units (LEWIS FAMILY INVESTMENTS, LLLP to LITTLE THOMPSON WATER DISTRICT in July, 2022).
+
+The most common transfer type was from a Class D to Class C followed by Class D to Class B-- both show a change from farm to municipal use.
+
+```{r, transfer_type, echo=F}
+transfer_type <- data4 %>%
+  group_by(transfer_type) %>%
+  summarise(n = n(),
+            total_units = sum(new_acre_foot_units),
+            avg_units = round(mean(new_acre_foot_units))) %>%
+  mutate(pct_units = round(total_units/sum(total_units), 2)*100) %>%
+  arrange(-total_units)
+
+datatable(transfer_type, extensions = 'Buttons', options = list(
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel', 'pdf', 'print')
+  )
+)
+```
+
+The top 3 receivers were all water districts, followed by cities and towns in the top 10.
+
+```{r, receivers, echo=F}
+# function to standardize names (vertically) with a buffer for string distance
+# over time there's some variations with extra commas/periods/middle initials
+standardize_name_fc <- function(name, buffer = 3) {
+  all_names <- unique(data4$current_allottee, data4$new_allottees)
+  closest_match <- all_names[stringdist::stringdist(name, all_names) <= buffer]
+  if (length(closest_match) > 0) {
+    return(closest_match[1])
+  } else {
+    return(name)
+  }
+}
+
+receivers <- data4 %>%
+  mutate(standardized_name = sapply(new_allottees, standardize_name_fc)) %>%
+  group_by(standardized_name) %>%
+  summarise(type = first(new_class),
+            n = n(),
+            total_units = sum(new_acre_foot_units)) %>%
+  arrange(-total_units)
+
+datatable(receivers, extensions = 'Buttons', options = list(
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel', 'pdf', 'print')
+  )
+)
+```
+
+## Data Viz ##
+
+<div class="flourish-embed flourish-sankey" data-src="visualisation/16833259"><script src="https://public.flourish.studio/resources/embed.js"></script></div>
+
+<div class="flourish-embed flourish-hierarchy" data-src="visualisation/16845773"><script src="https://public.flourish.studio/resources/embed.js"></script></div>
+
+<div class="flourish-embed flourish-chart" data-src="visualisation/16833225"><script src="https://public.flourish.studio/resources/embed.js"></script></div>
+
+
+
